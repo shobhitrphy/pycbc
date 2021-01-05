@@ -29,6 +29,7 @@ import os
 import numpy as np
 import lal
 import copy
+import logging
 from abc import ABCMeta, abstractmethod
 import lalsimulation as sim
 import h5py
@@ -82,6 +83,47 @@ def set_sim_data(inj, field, data):
     else:
         setattr(inj, sim_field, data)
 
+
+def projector(detector_name, inj, hp, hc, distance_scale=1):
+    """ Use the injection row to project the polarizations into the
+    detector frame
+    """
+    detector = Detector(detector_name)
+
+    hp /= distance_scale
+    hc /= distance_scale
+
+    try:
+        tc = inj.tc
+        ra = inj.ra
+        dec = inj.dec
+    except:
+        tc = inj.get_time_geocent()
+        ra = inj.longitude
+        dec = inj.latitude
+
+    hp.start_time += tc
+    hc.start_time += tc
+
+    # taper the polarizations
+    try:
+        hp_tapered = wfutils.taper_timeseries(hp, inj.taper)
+        hc_tapered = wfutils.taper_timeseries(hc, inj.taper)
+    except AttributeError:
+        hp_tapered = hp
+        hc_tapered = hc
+
+    projection_method = 'lal'
+    if hasattr(inj, 'detector_projection_method'):
+        projection_method = inj.detector_projection_method
+
+    logging.info('Injecting at %s, method is %s', tc, projection_method)
+
+    # compute the detector response and add it to the strain
+    signal = detector.project_wave(hp_tapered, hc_tapered,
+                                   ra, dec, inj.polarization,
+                                   method=projection_method)
+    return signal
 
 def legacy_approximant_name(apx):
     """Convert the old style xml approximant name to a name
@@ -228,7 +270,6 @@ class _XMLInjectionSet(object):
         signal : float
             h(t) corresponding to the injection.
         """
-        detector = Detector(detector_name)
         f_l = inj.f_lower if f_lower is None else f_lower
 
         name, phase_order = legacy_approximant_name(inj.waveform)
@@ -239,22 +280,8 @@ class _XMLInjectionSet(object):
             phase_order=phase_order,
             f_lower=f_l, distance=inj.distance,
             **self.extra_args)
-
-        hp /= distance_scale
-        hc /= distance_scale
-
-        hp._epoch += inj.get_time_geocent()
-        hc._epoch += inj.get_time_geocent()
-
-        # taper the polarizations
-        hp_tapered = wfutils.taper_timeseries(hp, inj.taper)
-        hc_tapered = wfutils.taper_timeseries(hc, inj.taper)
-
-        # compute the detector response and add it to the strain
-        signal = detector.project_wave(hp_tapered, hc_tapered,
-                             inj.longitude, inj.latitude, inj.polarization)
-
-        return signal
+        return projector(detector_name,
+                         inj, hp, hc, distance_scale=distance_scale)
 
     def end_times(self):
         """Return the end times of all injections"""
@@ -336,6 +363,11 @@ class _HDFInjectionSet(object):
         parameters = list(group.keys())
         # get all injection parameter values
         injvals = {param: group[param][()] for param in parameters}
+        # make sure Numpy S strings are loaded as strings and not bytestrings
+        # (which could mess with approximant names, for example)
+        for k in injvals:
+            if injvals[k].dtype.kind == 'S':
+                injvals[k] = injvals[k].astype('U')
         # if there were no variable args, then we only have a single injection
         if len(parameters) == 0:
             numinj = 1
@@ -343,7 +375,8 @@ class _HDFInjectionSet(object):
             numinj = tuple(injvals.values())[0].size
         # add any static args in the file
         try:
-            self.static_args = group.attrs['static_args']
+            # ensure parameter names are string types
+            self.static_args = group.attrs['static_args'].astype('U')
         except KeyError:
             self.static_args = []
         parameters.extend(self.static_args)
@@ -361,6 +394,9 @@ class _HDFInjectionSet(object):
                 # otherwise, we can just repeat the value the needed number of
                 # times
                 arr = np.repeat(val, numinj)
+            # make sure any byte strings are stored as strings instead
+            if arr.dtype.char == 'S':
+                arr = arr.astype('U')
             injvals[param] = arr
         # make sure a coalescence time is specified for injections
         if 'tc' not in injvals:
@@ -434,7 +470,15 @@ class _HDFInjectionSet(object):
                     # try decoding it and writing
                     fp.attrs[arg] = str(val)
             for field in write_params:
-                fp[field] = samples[field]
+                try:
+                    fp[field] = samples[field]
+                except TypeError as e:
+                    # can get this in python 3 if the val was a numpy.str_ type
+                    # we'll try again as a string type
+                    if samples[field].dtype.char == 'U':
+                        fp[field] = samples[field].astype('S')
+                    else:
+                        raise e
 
 
 class CBCHDFInjectionSet(_HDFInjectionSet):
@@ -546,7 +590,6 @@ class CBCHDFInjectionSet(_HDFInjectionSet):
         signal : float
             h(t) corresponding to the injection.
         """
-        detector = Detector(detector_name)
         if f_lower is None:
             f_l = inj.f_lower
         else:
@@ -555,26 +598,8 @@ class CBCHDFInjectionSet(_HDFInjectionSet):
         # compute the waveform time series
         hp, hc = get_td_waveform(inj, delta_t=delta_t, f_lower=f_l,
                                  **self.extra_args)
-
-        hp /= distance_scale
-        hc /= distance_scale
-
-        hp._epoch += inj.tc
-        hc._epoch += inj.tc
-
-        # taper the polarizations
-        try:
-            hp_tapered = wfutils.taper_timeseries(hp, inj.taper)
-            hc_tapered = wfutils.taper_timeseries(hc, inj.taper)
-        except AttributeError:
-            hp_tapered = hp
-            hc_tapered = hc
-
-        # compute the detector response and add it to the strain
-        signal = detector.project_wave(hp_tapered, hc_tapered,
-                             inj.ra, inj.dec, inj.polarization)
-
-        return signal
+        return projector(detector_name,
+                         inj, hp, hc, distance_scale=distance_scale)
 
     def end_times(self):
         """Return the end times of all injections"""
@@ -673,24 +698,11 @@ class RingdownHDFInjectionSet(_HDFInjectionSet):
         signal : float
             h(t) corresponding to the injection.
         """
-        detector = Detector(detector_name)
-
         # compute the waveform time series
         hp, hc = ringdown_td_approximants[inj['approximant']](
             inj, delta_t=delta_t, **self.extra_args)
-
-        hp._epoch += inj['tc']
-        hc._epoch += inj['tc']
-
-        if distance_scale != 1:
-            hp /= distance_scale
-            hc /= distance_scale
-
-        # compute the detector response and add it to the strain
-        signal = detector.project_wave(hp, hc,
-                             inj['ra'], inj['dec'], inj['polarization'])
-
-        return signal
+        return projector(detector_name,
+                         inj, hp, hc, distance_scale=distance_scale)
 
     def end_times(self):
         """Return the approximate end times of all injections.
@@ -734,7 +746,17 @@ def get_hdf_injtype(sim_file):
             ftype = fp.attrs['injtype']
         except KeyError:
             ftype = CBCHDFInjectionSet.injtype
-    return hdfinjtypes[ftype]
+    try:
+        return hdfinjtypes[ftype]
+    except KeyError:
+        # may get a key error if the file type was stored as unicode instead
+        # of string; if so, try decoding it
+        try:
+            ftype = str(ftype.decode())
+        except AttributeError:
+            # not actually a byte error; passing will reraise the KeyError
+            pass
+        return hdfinjtypes[ftype]
 
 
 def hdf_injtype_from_approximant(approximant):

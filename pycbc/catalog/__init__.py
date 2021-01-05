@@ -25,6 +25,8 @@
 """ This package provides information about LIGO/Virgo detections of
 compact binary mergers
 """
+
+import os
 import numpy
 from . import catalog
 
@@ -120,15 +122,13 @@ class Merger(object):
         strain: pycbc.types.TimeSeries
             Strain around the event.
         """
-        from astropy.utils.data import download_file
+        from pycbc.io import get_file
         from pycbc.frame import read_frame
 
         if sample_rate == 4096:
             sampling = "4KHz"
         elif sample_rate == 16384:
             sampling = "16KHz"
-
-        channel = "{}:GWOSC-{}_R1_STRAIN".format(ifo, sampling.upper())
 
         for fdict in self.data['strain']:
             if (fdict['detector'] == ifo and fdict['duration'] == duration and
@@ -137,7 +137,10 @@ class Merger(object):
                 url = fdict['url']
                 break
 
-        filename = download_file(url, cache=True)
+        ver = url.split('/')[-1].split('-')[1].split('_')[-1]
+        channel = "{}:GWOSC-{}_{}_STRAIN".format(ifo, sampling.upper(), ver)
+
+        filename = get_file(url, cache=True)
         return read_frame(str(filename), str(channel))
 
 
